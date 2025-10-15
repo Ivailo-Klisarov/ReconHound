@@ -9,6 +9,8 @@ The script can be executed directly and supports exporting results either as JSO
 """
 # Test from Stoyan
 
+# Second test from Stoyan
+
 from __future__ import annotations
 
 import argparse
