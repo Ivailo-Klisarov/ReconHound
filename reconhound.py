@@ -11,6 +11,8 @@ The script can be executed directly and supports exporting results either as JSO
 
 # Second test from Stoyan
 
+# Third test - final this time
+
 from __future__ import annotations
 
 import argparse
