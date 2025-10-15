@@ -1,0 +1,4 @@
+# Assignments for Stoyan:
+
+- Wordlist which goes over phone numbers
+- Function with a regex which goes over the most typical names which always start with the first letter as capital and the other letters as non-capital
