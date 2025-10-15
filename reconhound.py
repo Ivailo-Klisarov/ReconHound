@@ -7,6 +7,8 @@ includes robust error handling so that unexpected failures do not crash the proc
 
 The script can be executed directly and supports exporting results either as JSON or XML.
 """
+# Test from Stoyan
+
 from __future__ import annotations
 
 import argparse
