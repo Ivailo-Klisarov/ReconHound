@@ -15,8 +15,11 @@ import logging
 import re
 import sys
 from dataclasses import dataclass, asdict
-from typing import Dict, Iterable, List, Optional, Set
-from urllib.parse import urljoin, urlparse
+from functools import lru_cache
+from pathlib import Path
+from collections import defaultdict
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse, urlunparse
 from urllib import robotparser
 
 import requests
@@ -46,8 +49,25 @@ JOB_TITLE_KEYWORDS = {
     "administrator",
 }
 
-# A loose pattern for detecting likely first + last name combinations.
-NAME_REGEX = re.compile(r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b")
+WORD_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z'-]*)\b")
+PHONE_REGEX = re.compile(r"\+?\d[\d\s().-]{6,}\d")
+FIRST_NAMES_PATH = Path(__file__).resolve().with_name("first_names.txt")
+
+
+@lru_cache(maxsize=1)
+def load_first_names() -> Set[str]:
+    """Load first names from the bundled wordlist."""
+    first_names: Set[str] = set()
+    try:
+        with FIRST_NAMES_PATH.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                name = line.strip()
+                if not name or name.startswith("#"):
+                    continue
+                first_names.add(name.lower())
+    except OSError as exc:
+        logger.debug("First-name wordlist %s unavailable: %s", FIRST_NAMES_PATH, exc)
+    return first_names
 
 
 @dataclass
@@ -99,11 +119,16 @@ class RobotsCache:
 class ReconHoundScraper:
     """High-level scraper class that orchestrates data collection for domains."""
 
-    def __init__(self, user_agent: str = "ReconHound/1.0 (+https://example.com/reconhound)"):
+    def __init__(
+        self,
+        user_agent: str = "ReconHound/1.0 (+https://example.com/reconhound)",
+        respect_robots_txt: bool = True,
+    ):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
         self.user_agent = user_agent
         self.robots_cache = RobotsCache(self.session)
+        self.respect_robots_txt = respect_robots_txt
 
     def scrape_domains(self, domains: Iterable[str], max_pages_per_domain: int = 5) -> Dict[str, List[Finding]]:
         """Scrape a series of domains, returning findings grouped by domain.
@@ -120,16 +145,30 @@ class ReconHoundScraper:
             findings: List[Finding] = []
             visited: Set[str] = set()
             queue: List[str] = []
+            normalized_domain = domain.strip()
+            seen_values: Dict[str, Set[str]] = defaultdict(set)
 
-            for scheme in ("https://", "http://"):
-                start_url = f"{scheme}{domain.strip('/')}/"
-                if self._allowed(start_url) and self._fetchable(start_url):
-                    queue.append(start_url)
+            if not normalized_domain:
+                aggregated[domain] = findings
+                continue
+
+            candidates = self._build_candidate_start_urls(normalized_domain)
+
+            start_url: Optional[str] = None
+            allowed_path_prefix = "/"
+
+            for candidate_url, candidate_prefix in candidates:
+                if self._allowed(candidate_url) and self._fetchable(candidate_url):
+                    start_url = candidate_url
+                    allowed_path_prefix = candidate_prefix
                     break
-            else:
+
+            if not start_url:
                 logger.warning("Skipping %s: no accessible HTTP(S) endpoint", domain)
                 aggregated[domain] = findings
                 continue
+
+            queue.append(start_url)
 
             while queue and len(visited) < max_pages_per_domain:
                 url = queue.pop(0)
@@ -137,8 +176,14 @@ class ReconHoundScraper:
                     continue
                 visited.add(url)
 
-                page_findings, links = self._scrape_page(url)
-                findings.extend(page_findings)
+                page_findings, links = self._scrape_page(url, allowed_path_prefix)
+                for finding in page_findings:
+                    value_key = finding.value.lower()
+                    type_seen = seen_values[finding.type]
+                    if value_key in type_seen:
+                        continue
+                    type_seen.add(value_key)
+                    findings.append(finding)
 
                 for link in links:
                     if len(visited) + len(queue) >= max_pages_per_domain:
@@ -148,6 +193,39 @@ class ReconHoundScraper:
 
             aggregated[domain] = findings
         return aggregated
+
+    def _build_candidate_start_urls(self, normalized_domain: str) -> List[Tuple[str, str]]:
+        """Return possible start URLs paired with their allowed path prefixes."""
+        candidates: List[Tuple[str, str]] = []
+        parsed = urlparse(normalized_domain)
+
+        if parsed.scheme and parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+            scheme = parsed.scheme.lower()
+            normalized_path = self._normalize_allowed_path(parsed.path or "/")
+            rebuilt = urlunparse((scheme, parsed.netloc, normalized_path, "", "", ""))
+            candidates.append((rebuilt, normalized_path))
+            return candidates
+
+        trimmed = normalized_domain.strip("/")
+        if not trimmed:
+            return candidates
+
+        if "/" in trimmed:
+            host, remainder = trimmed.split("/", 1)
+            path = f"/{remainder}"
+        else:
+            host = trimmed
+            path = "/"
+
+        if not host:
+            return candidates
+
+        normalized_path = self._normalize_allowed_path(path)
+        for scheme in ("https", "http"):
+            rebuilt = f"{scheme}://{host}{normalized_path}"
+            candidates.append((rebuilt, normalized_path))
+
+        return candidates
 
     def _fetchable(self, url: str) -> bool:
         """Check if the URL responds successfully with a GET request."""
@@ -165,13 +243,15 @@ class ReconHoundScraper:
 
     def _allowed(self, url: str) -> bool:
         """Return True if the URL is allowed according to robots.txt."""
+        if not self.respect_robots_txt:
+            return True
         allowed = self.robots_cache.can_fetch(url, self.user_agent)
         if not allowed:
             logger.info("Blocked by robots.txt: %s", url)
         return allowed
 
-    def _scrape_page(self, url: str) -> (List[Finding], List[str]):
-        """Scrape a single page, returning findings and discovered internal links."""
+    def _scrape_page(self, url: str, allowed_path_prefix: str) -> (List[Finding], List[str]):
+        """Scrape a single page, returning findings and discovered in-scope internal links."""
         findings: List[Finding] = []
         links: List[str] = []
 
@@ -184,26 +264,70 @@ class ReconHoundScraper:
 
         soup = BeautifulSoup(response.text, "html.parser")
         base_url = response.url
+        base_path = urlparse(base_url).path
+
+        if not self._is_within_allowed_path(base_path, allowed_path_prefix):
+            logger.debug(
+                "Skipping %s redirected to %s outside allowed path %s",
+                url,
+                base_url,
+                allowed_path_prefix,
+            )
+            return findings, links
 
         findings.extend(self._extract_emails(soup, base_url))
+        findings.extend(self._extract_phone_numbers(soup, base_url))
         findings.extend(self._extract_people_info(soup, base_url))
 
-        links.extend(self._extract_internal_links(soup, base_url))
+        links.extend(self._extract_internal_links(soup, base_url, allowed_path_prefix))
         return findings, links
 
     def _extract_emails(self, soup: BeautifulSoup, url: str) -> List[Finding]:
         """Extract email addresses from the soup and return them as findings."""
         findings: List[Finding] = []
+        seen_emails: Set[str] = set()
 
         # Email addresses surfaced via ``mailto:`` links.
         for mail_link in soup.select('a[href^="mailto:"]'):
             email = mail_link.get("href", "").split(":", 1)[-1]
             if email and EMAIL_REGEX.fullmatch(email):
+                normalized = email.lower()
+                if normalized in seen_emails:
+                    continue
+                seen_emails.add(normalized)
                 findings.append(Finding("email", email, mail_link.get_text(strip=True) or None, url))
 
         # Fallback: parse raw text content for email-like strings.
         for match in EMAIL_REGEX.findall(soup.get_text("\n")):
+            normalized = match.lower()
+            if normalized in seen_emails:
+                continue
+            seen_emails.add(normalized)
             findings.append(Finding("email", match, None, url))
+
+        return findings
+
+    def _extract_phone_numbers(self, soup: BeautifulSoup, url: str) -> List[Finding]:
+        """Extract phone numbers from the soup."""
+        findings: List[Finding] = []
+        seen_numbers: Set[str] = set()
+
+        for tel_link in soup.select('a[href^="tel:"]'):
+            raw_number = tel_link.get("href", "").split(":", 1)[-1]
+            normalized = self._normalize_phone_value(raw_number)
+            if not normalized or normalized in seen_numbers:
+                continue
+            seen_numbers.add(normalized)
+            findings.append(Finding("phone", normalized, tel_link.get_text(strip=True) or raw_number, url))
+
+        text_content = soup.get_text(" ")
+        for match in PHONE_REGEX.finditer(text_content):
+            raw_candidate = match.group().strip()
+            normalized = self._normalize_phone_value(raw_candidate)
+            if not normalized or normalized in seen_numbers:
+                continue
+            seen_numbers.add(normalized)
+            findings.append(Finding("phone", normalized, raw_candidate, url))
 
         return findings
 
@@ -211,13 +335,64 @@ class ReconHoundScraper:
         """Attempt to extract names and job titles from page content."""
         findings: List[Finding] = []
         text_blocks = [t.strip() for t in soup.stripped_strings if len(t.strip()) <= 120]
+        first_names = load_first_names()
+        seen_identifiers: Set[str] = set()
 
         for block in text_blocks:
             lower_block = block.lower()
+            used_word_indices: Set[int] = set()
 
-            # Identify likely names.
-            for match in NAME_REGEX.findall(block):
-                findings.append(Finding("name", match, block, url))
+            # Identify likely names using the first-name wordlist and capitalized surnames.
+            words = [match.group(0) for match in WORD_PATTERN.finditer(block)]
+            for idx, raw_first in enumerate(words):
+                if idx in used_word_indices:
+                    continue
+                if not raw_first or not raw_first[0].isupper():
+                    continue
+                if len(raw_first) <= 1 or not any(ch.islower() for ch in raw_first[1:]):
+                    continue
+
+                normalized_first = raw_first.lower()
+                allowed_first = normalized_first in first_names
+                if not allowed_first and idx == 0 and len(words) == 2:
+                    raw_last_candidate = words[1]
+                    if raw_last_candidate and raw_last_candidate[0].isupper() and any(
+                        ch.islower() for ch in raw_last_candidate[1:]
+                    ):
+                        allowed_first = True
+                if not allowed_first:
+                    continue
+                first_key = f"first:{normalized_first}"
+
+                raw_last: Optional[str] = None
+                last_idx: Optional[int] = None
+                for candidate_idx in range(idx + 1, len(words)):
+                    candidate = words[candidate_idx]
+                    if not candidate or not candidate[0].isupper():
+                        break
+                    if len(candidate) <= 1 or not any(ch.islower() for ch in candidate[1:]):
+                        continue
+                    raw_last = candidate
+                    last_idx = candidate_idx
+                    break
+
+                if raw_last:
+                    normalized_last = raw_last.lower()
+                    full_key = f"full:{normalized_first}:{normalized_last}"
+                    if full_key in seen_identifiers:
+                        continue
+                    seen_identifiers.add(full_key)
+                    seen_identifiers.add(first_key)
+                    if last_idx is not None:
+                        # mark words used in this full name to avoid treating surname as standalone
+                        used_word_indices.update({idx, last_idx})
+                    full_name = f"{raw_first} {raw_last}"
+                    findings.append(Finding("name", full_name, block, url))
+                else:
+                    if first_key in seen_identifiers:
+                        continue
+                    seen_identifiers.add(first_key)
+                    findings.append(Finding("name", raw_first, block, url))
 
             # Identify potential job titles.
             if any(keyword in lower_block for keyword in JOB_TITLE_KEYWORDS):
@@ -225,8 +400,54 @@ class ReconHoundScraper:
 
         return findings
 
-    def _extract_internal_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
-        """Extract internal links within the same domain as ``base_url``."""
+    @staticmethod
+    def _normalize_phone_value(raw: str) -> Optional[str]:
+        """Return a canonical phone representation or None if invalid."""
+        digits = re.sub(r"\D", "", raw)
+        if len(digits) < 7:
+            return None
+        if raw.strip().startswith("+"):
+            return f"+{digits}"
+        return digits
+
+    @staticmethod
+    def _normalize_allowed_path(path: str) -> str:
+        if not path:
+            return "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        if path == "/":
+            return "/"
+        # Treat paths ending with a slash as directories.
+        if path.endswith("/"):
+            return path.rstrip("/") + "/"
+        last_segment = path.rsplit("/", 1)[-1]
+        # If the last segment looks like a file (contains a dot), keep it as-is.
+        if "." in last_segment:
+            return path
+        return path + "/"
+
+    @staticmethod
+    def _is_within_allowed_path(candidate_path: str, allowed_prefix: str) -> bool:
+        if allowed_prefix == "/":
+            return True
+        candidate = candidate_path or "/"
+        if not candidate.startswith("/"):
+            candidate = "/" + candidate
+        if allowed_prefix.endswith("/"):
+            if candidate == allowed_prefix[:-1]:
+                return True
+            return candidate.startswith(allowed_prefix)
+        # File-scoped crawl: require an exact match.
+        return candidate == allowed_prefix
+
+    def _extract_internal_links(
+        self,
+        soup: BeautifulSoup,
+        base_url: str,
+        allowed_path_prefix: str,
+    ) -> List[str]:
+        """Extract internal links within the allowed domain/path scope."""
         links: List[str] = []
         parsed_base = urlparse(base_url)
         base_domain = parsed_base.netloc
@@ -238,7 +459,8 @@ class ReconHoundScraper:
             joined = urljoin(base_url, href)
             parsed_link = urlparse(joined)
             if parsed_link.netloc == base_domain and parsed_link.scheme in {"http", "https"}:
-                links.append(joined)
+                if self._is_within_allowed_path(parsed_link.path, allowed_path_prefix):
+                    links.append(joined)
 
         return links
 
@@ -309,6 +531,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=5,
         help="Maximum number of pages to visit per domain.",
     )
+    parser.add_argument(
+        "--ignore-robots",
+        action="store_true",
+        help="Override robots.txt and crawl even when disallowed.",
+    )
     return parser.parse_args(argv)
 
 
@@ -341,7 +568,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.error("No domains provided. Use --help for usage information.")
         return 1
 
-    scraper = ReconHoundScraper()
+    scraper = ReconHoundScraper(respect_robots_txt=not args.ignore_robots)
     findings = scraper.scrape_domains(domains, max_pages_per_domain=args.max_pages)
 
     serialized = output_data(findings, args.format, output_file=args.output)
