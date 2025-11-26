@@ -51,7 +51,35 @@ JOB_TITLE_KEYWORDS = {
 
 WORD_PATTERN = re.compile(r"\b([A-Za-z][A-Za-z'-]*)\b")
 PHONE_REGEX = re.compile(r"\+?\d[\d\s().-]{6,}\d")
+SOCIAL_TEXT_PATTERNS = [
+    (
+        re.compile(
+            r"\b(twitter|instagram|linkedin|github|facebook|tiktok|youtube)\b[^@]{0,40}@([A-Za-z0-9_.-]{2,30})",
+            re.IGNORECASE,
+        ),
+        "platform-first",
+    ),
+    (
+        re.compile(
+            r"@([A-Za-z0-9_.-]{2,30})[^@]{0,40}\b(twitter|instagram|linkedin|github|facebook|tiktok|youtube)\b",
+            re.IGNORECASE,
+        ),
+        "handle-first",
+    ),
+]
 FIRST_NAMES_PATH = Path(__file__).resolve().with_name("first_names.txt")
+LAST_NAMES_PATH = Path(__file__).resolve().with_name("last-names.txt")
+SOCIAL_HOST_PLATFORMS = {
+    "twitter.com": "twitter",
+    "x.com": "twitter",
+    "instagram.com": "instagram",
+    "linkedin.com": "linkedin",
+    "github.com": "github",
+    "facebook.com": "facebook",
+    "fb.com": "facebook",
+    "youtube.com": "youtube",
+    "tiktok.com": "tiktok",
+}
 
 
 @lru_cache(maxsize=1)
@@ -68,6 +96,22 @@ def load_first_names() -> Set[str]:
     except OSError as exc:
         logger.debug("First-name wordlist %s unavailable: %s", FIRST_NAMES_PATH, exc)
     return first_names
+
+
+@lru_cache(maxsize=1)
+def load_last_names() -> Set[str]:
+    """Load last names from the bundled wordlist."""
+    last_names: Set[str] = set()
+    try:
+        with LAST_NAMES_PATH.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                name = line.strip()
+                if not name or name.startswith("#"):
+                    continue
+                last_names.add(name.lower())
+    except OSError as exc:
+        logger.debug("Last-name wordlist %s unavailable: %s", LAST_NAMES_PATH, exc)
+    return last_names
 
 
 @dataclass
@@ -123,12 +167,14 @@ class ReconHoundScraper:
         self,
         user_agent: str = "ReconHound/1.0 (+https://example.com/reconhound)",
         respect_robots_txt: bool = True,
+        strict_names: bool = False,
     ):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
         self.user_agent = user_agent
         self.robots_cache = RobotsCache(self.session)
         self.respect_robots_txt = respect_robots_txt
+        self.strict_names = strict_names
 
     def scrape_domains(self, domains: Iterable[str], max_pages_per_domain: int = 5) -> Dict[str, List[Finding]]:
         """Scrape a series of domains, returning findings grouped by domain.
@@ -277,6 +323,7 @@ class ReconHoundScraper:
 
         findings.extend(self._extract_emails(soup, base_url))
         findings.extend(self._extract_phone_numbers(soup, base_url))
+        findings.extend(self._extract_social_handles(soup, base_url))
         findings.extend(self._extract_people_info(soup, base_url))
 
         links.extend(self._extract_internal_links(soup, base_url, allowed_path_prefix))
@@ -331,18 +378,61 @@ class ReconHoundScraper:
 
         return findings
 
+    def _extract_social_handles(self, soup: BeautifulSoup, url: str) -> List[Finding]:
+        """Extract social media handles or profile URLs."""
+        findings: List[Finding] = []
+        seen_handles: Set[str] = set()
+
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"].strip()
+            if not href:
+                continue
+            parsed = urlparse(urljoin(url, href))
+            platform = self._social_platform_for_host(parsed.netloc)
+            if not platform:
+                continue
+            identifier = self._extract_handle_from_social_path(platform, parsed.path)
+            if not identifier:
+                continue
+            normalized = f"{platform}:{identifier.lower()}"
+            if normalized in seen_handles:
+                continue
+            seen_handles.add(normalized)
+            context = anchor.get_text(strip=True) or parsed.geturl()
+            findings.append(Finding("social", f"{platform}:{identifier}", context, url))
+
+        text_blocks = [t.strip() for t in soup.stripped_strings if len(t.strip()) <= 160]
+        for block in text_blocks:
+            for pattern, order in SOCIAL_TEXT_PATTERNS:
+                for match in pattern.finditer(block):
+                    if order == "platform-first":
+                        platform_raw, handle_raw = match.groups()
+                    else:
+                        handle_raw, platform_raw = match.groups()
+                    platform = platform_raw.lower()
+                    identifier = handle_raw.strip(".")
+                    if not identifier:
+                        continue
+                    normalized = f"{platform}:{identifier.lower()}"
+                    if normalized in seen_handles:
+                        continue
+                    seen_handles.add(normalized)
+                    findings.append(Finding("social", f"{platform}:{identifier}", block, url))
+
+        return findings
+
     def _extract_people_info(self, soup: BeautifulSoup, url: str) -> List[Finding]:
         """Attempt to extract names and job titles from page content."""
         findings: List[Finding] = []
-        text_blocks = [t.strip() for t in soup.stripped_strings if len(t.strip()) <= 120]
+        text_blocks = [t.strip() for t in soup.stripped_strings if 2 <= len(t.strip()) <= 60]
         first_names = load_first_names()
+        last_names = load_last_names()
         seen_identifiers: Set[str] = set()
 
         for block in text_blocks:
             lower_block = block.lower()
             used_word_indices: Set[int] = set()
 
-            # Identify likely names using the first-name wordlist and capitalized surnames.
             words = [match.group(0) for match in WORD_PATTERN.finditer(block)]
             for idx, raw_first in enumerate(words):
                 if idx in used_word_indices:
@@ -353,14 +443,7 @@ class ReconHoundScraper:
                     continue
 
                 normalized_first = raw_first.lower()
-                allowed_first = normalized_first in first_names
-                if not allowed_first and idx == 0 and len(words) == 2:
-                    raw_last_candidate = words[1]
-                    if raw_last_candidate and raw_last_candidate[0].isupper() and any(
-                        ch.islower() for ch in raw_last_candidate[1:]
-                    ):
-                        allowed_first = True
-                if not allowed_first:
+                if normalized_first not in first_names:
                     continue
                 first_key = f"first:{normalized_first}"
 
@@ -378,23 +461,28 @@ class ReconHoundScraper:
 
                 if raw_last:
                     normalized_last = raw_last.lower()
-                    full_key = f"full:{normalized_first}:{normalized_last}"
-                    if full_key in seen_identifiers:
+                    last_in_list = normalized_last in last_names if last_names else False
+                    if last_in_list:
+                        full_key = f"full:{normalized_first}:{normalized_last}"
+                        if full_key in seen_identifiers:
+                            continue
+                        seen_identifiers.add(full_key)
+                        seen_identifiers.add(first_key)
+                        if last_idx is not None:
+                            used_word_indices.update({idx, last_idx})
+                        findings.append(Finding("possible_name", f"{raw_first} {raw_last}", block, url))
                         continue
-                    seen_identifiers.add(full_key)
-                    seen_identifiers.add(first_key)
-                    if last_idx is not None:
-                        # mark words used in this full name to avoid treating surname as standalone
-                        used_word_indices.update({idx, last_idx})
-                    full_name = f"{raw_first} {raw_last}"
-                    findings.append(Finding("name", full_name, block, url))
-                else:
-                    if first_key in seen_identifiers:
+                    if self.strict_names:
                         continue
-                    seen_identifiers.add(first_key)
-                    findings.append(Finding("name", raw_first, block, url))
 
-            # Identify potential job titles.
+                if self.strict_names:
+                    continue
+
+                if first_key in seen_identifiers:
+                    continue
+                seen_identifiers.add(first_key)
+                findings.append(Finding("possible_name", raw_first, block, url))
+
             if any(keyword in lower_block for keyword in JOB_TITLE_KEYWORDS):
                 findings.append(Finding("occupation", block, block, url))
 
@@ -409,6 +497,28 @@ class ReconHoundScraper:
         if raw.strip().startswith("+"):
             return f"+{digits}"
         return digits
+
+    def _social_platform_for_host(self, host: str) -> Optional[str]:
+        if not host:
+            return None
+        normalized = host.lower().split(":", 1)[0].lstrip(".")
+        if normalized.startswith("www."):
+            normalized = normalized[4:]
+        return SOCIAL_HOST_PLATFORMS.get(normalized)
+
+    def _extract_handle_from_social_path(self, platform: str, path: str) -> Optional[str]:
+        segments = [segment for segment in path.split("/") if segment]
+        if not segments:
+            return None
+        if platform == "linkedin":
+            if segments[0] in {"in", "company", "school"} and len(segments) >= 2:
+                return f"{segments[0]}/{segments[1]}"
+            return segments[0]
+        if platform == "facebook" and segments[0] == "pages":
+            if len(segments) >= 3:
+                return segments[2]
+            return None
+        return segments[0]
 
     @staticmethod
     def _normalize_allowed_path(path: str) -> str:
@@ -536,6 +646,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Override robots.txt and crawl even when disallowed.",
     )
+    parser.add_argument(
+        "--strict-names",
+        action="store_true",
+        help="Only report names when both first and last tokens exist in the wordlist.",
+    )
     return parser.parse_args(argv)
 
 
@@ -568,7 +683,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.error("No domains provided. Use --help for usage information.")
         return 1
 
-    scraper = ReconHoundScraper(respect_robots_txt=not args.ignore_robots)
+    scraper = ReconHoundScraper(respect_robots_txt=not args.ignore_robots, strict_names=args.strict_names)
     findings = scraper.scrape_domains(domains, max_pages_per_domain=args.max_pages)
 
     serialized = output_data(findings, args.format, output_file=args.output)
